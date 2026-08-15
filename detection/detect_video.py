@@ -131,6 +131,12 @@ def run(args):
     prev_time = time.time()
     frame_idx = 0
 
+    # FPS 측정: 처음 --warmup-frames장은 모델/디바이스 워밍업(캐시 미스, CUDA 컨텍스트
+    # 초기화 등)으로 느리게 나오므로 평균 계산에서 제외한다. 워밍업이 끝나는 시점부터
+    # 시간을 다시 재기 시작해서 순수 추론 구간만 평균을 낸다.
+    avg_start_time = None
+    avg_frame_count = 0
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -159,7 +165,16 @@ def run(args):
         now = time.time()
         fps = 1.0 / max(now - prev_time, 1e-6)
         prev_time = now
-        cv2.putText(frame, f"FPS: {fps:.1f}  persons: {len(boxes)}", (10, 20),
+
+        is_warmup = frame_idx < args.warmup_frames
+        if not is_warmup:
+            if avg_start_time is None:
+                avg_start_time = now  # 워밍업 직후 첫 프레임 시점부터 평균 집계 시작
+            else:
+                avg_frame_count += 1
+        avg_fps = avg_frame_count / max(now - avg_start_time, 1e-6) if avg_start_time else 0.0
+
+        cv2.putText(frame, f"FPS: {fps:.1f} (avg {avg_fps:.1f})  persons: {len(boxes)}", (10, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         if writer is not None:
@@ -168,8 +183,10 @@ def run(args):
             cv2.imshow("Person Detection", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-        elif args.print_every and frame_idx % args.print_every == 0:
-            print(f"frame {frame_idx}: FPS={fps:.1f} persons={len(boxes)}")
+        if args.print_every and frame_idx % args.print_every == 0:
+            tag = " [워밍업]" if is_warmup else ""
+            print(f"frame {frame_idx}: FPS={fps:.1f}  avg_FPS={avg_fps:.1f}  "
+                  f"persons={len(boxes)}{tag}")
 
         frame_idx += 1
 
@@ -178,6 +195,15 @@ def run(args):
         writer.release()
     if not args.no_display:
         cv2.destroyAllWindows()
+
+    if avg_frame_count > 0:
+        total_elapsed = time.time() - avg_start_time
+        print(f"\n[FPS 요약] 워밍업 {args.warmup_frames}프레임 제외, "
+              f"측정 {avg_frame_count}프레임, 총 {total_elapsed:.2f}초 "
+              f"-> 평균 {avg_frame_count / total_elapsed:.2f} FPS")
+    else:
+        print("\n[FPS 요약] 워밍업 이후 프레임이 없어 평균을 계산할 수 없습니다 "
+              f"(영상이 --warmup-frames={args.warmup_frames}보다 짧음).")
 
 
 def main():
@@ -191,7 +217,12 @@ def main():
     parser.add_argument("--device", default=None, help="미지정 시 cuda 사용 가능하면 cuda, 아니면 cpu")
     parser.add_argument("--save", default=None, help="결과 영상을 저장할 경로 (mp4)")
     parser.add_argument("--no-display", action="store_true", help="GUI 없이 실행 (RPi 헤드리스 환경용)")
-    parser.add_argument("--print-every", type=int, default=30, help="--no-display일 때 콘솔 로그 출력 간격(프레임)")
+    parser.add_argument("--print-every", type=int, default=30,
+                        help="콘솔에 FPS를 출력할 프레임 간격 (0이면 출력 안 함). "
+                             "--no-display 여부와 무관하게 항상 출력됨")
+    parser.add_argument("--warmup-frames", type=int, default=10,
+                        help="평균 FPS 계산에서 제외할 초반 프레임 수 (모델/디바이스 초기화 "
+                             "오버헤드로 처음 몇 프레임은 느리게 나오므로 평균이 왜곡되는 것을 방지)")
     args = parser.parse_args()
 
     run(args)
