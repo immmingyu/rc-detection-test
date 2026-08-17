@@ -6,6 +6,13 @@ YOLOv8 계열과, hi/01_custom_model의 커스텀 grid 계열 모델을 둘 다 
 RPi4 배포를 염두에 두고 torch, cv2, numpy만 있으면 동작함
 (pandas/albumentations 등 학습용 의존성 불필요 — requirements.txt 참고).
 
+== --backend (torch 또는 onnx) ==
+--weights 확장자(.onnx)로 자동 감지하거나 --backend onnx로 명시할 수 있음.
+전처리(letterbox/grid_preprocess)와 후처리(decode_yolo_output/decode_prediction/
+decode_levels/nms)는 백엔드와 완전히 무관하게 그대로 재사용한다 - run_inference()가
+onnxruntime의 numpy 입출력을 기존 코드가 기대하는 torch.Tensor로 앞뒤에서만
+변환해주는 얇은 어댑터 역할이라, 모델 로드/추론 호출부만 바뀐다.
+
 == --model-type yolo (기본값) ==
 letterbox / decode_yolo_output / nms는 viewer/VideoThread.h의 C++ 구현과
 반드시 동일한 수식을 유지해야 함. 한쪽만 고치면 같은 모델인데 결과가
@@ -176,12 +183,46 @@ def nms(boxes, iou_threshold=0.45):
     return keep
 
 
-def load_model(weights_path, device):
-    """TorchScript 모델 로드. .pt / .torchscript 등 확장자와 무관하게 동작한다."""
+def resolve_backend(backend, weights_path):
+    """backend='auto'면 --weights 확장자로 torch/onnx를 자동 판별."""
+    if backend != "auto":
+        return backend
+    return "onnx" if weights_path.lower().endswith(".onnx") else "torch"
+
+
+def load_model(weights_path, device, backend):
+    """backend='onnx'면 onnxruntime.InferenceSession, 아니면 기존과 동일하게
+    TorchScript 로드(.pt/.torchscript 등 확장자와 무관하게 동작)."""
+    if backend == "onnx":
+        import onnxruntime as ort
+
+        # CUDAExecutionProvider는 onnxruntime-gpu가 깔려 있어야 실제로 잡힘.
+        # 없으면 onnxruntime이 자동으로 CPU로 넘어가므로 굳이 미리 검사하지 않는다.
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if device.type == "cuda" \
+            else ["CPUExecutionProvider"]
+        session = ort.InferenceSession(weights_path, providers=providers)
+        print(f"ONNX 모델 로드: {weights_path} (providers={session.get_providers()})")
+        return session
+
     model = torch.jit.load(weights_path, map_location=device)
     model.eval()
     print(f"TorchScript 모델 로드: {weights_path} (device={device})")
     return model
+
+
+def run_inference(model, tensor, backend):
+    """backend에 따라 추론하고, decode 함수들이 그대로 쓸 수 있게 torch.Tensor로
+    통일해서 반환한다. onnxruntime은 numpy 입출력이라 앞뒤로만 변환하고, letterbox/
+    decode_yolo_output/decode_prediction/decode_levels/nms는 완전히 그대로 재사용됨.
+    출력이 여러 개인 모델(FPN 등)이면 tuple로 반환해 decode_levels가 처리하게 함."""
+    if backend == "onnx":
+        input_name = model.get_inputs()[0].name
+        outputs = model.run(None, {input_name: tensor.cpu().numpy()})
+        tensors = [torch.from_numpy(o) for o in outputs]
+        return tensors[0] if len(tensors) == 1 else tuple(tensors)
+
+    with torch.no_grad():
+        return model(tensor)
 
 
 def run(args):
@@ -192,7 +233,7 @@ def run(args):
     else:
         device = torch.device("cpu")
 
-    model = load_model(args.weights, device)
+    model = load_model(args.weights, device, args.backend)
 
     source = int(args.source) if args.source.isdigit() else args.source
     cap = cv2.VideoCapture(source)
@@ -228,8 +269,7 @@ def run(args):
         else:
             tensor, scale, pad_x, pad_y = preprocess(frame, args.imgsz, device)
 
-        with torch.no_grad():
-            output = model(tensor)
+        output = run_inference(model, tensor, args.backend)
 
         if args.model_type == "grid":
             # 단일 스케일이면 (1,5,H,W) 텐서 하나, FPN이면 레벨별 텐서 tuple ->
@@ -307,6 +347,9 @@ def main():
     parser = argparse.ArgumentParser(description="YOLOv8 보행자 탐지 실시간 추론")
     parser.add_argument("--source", default="0", help="웹캠 인덱스(예: 0) 또는 영상/이미지 파일 경로")
     parser.add_argument("--weights", default="./models/best.torchscript")
+    parser.add_argument("--backend", choices=["auto", "torch", "onnx"], default="auto",
+                        help="auto(기본값)면 --weights 확장자(.onnx)로 자동 판별. "
+                             "명시하려면 --backend onnx / --backend torch")
     parser.add_argument("--model-type", choices=["yolo", "grid"], default="yolo",
                         help="yolo=letterbox+이미 디코드된 (1,5,N) 출력 (best.torchscript 등). "
                              "grid=hi/01_custom_model 커스텀 grid 모델(9단계 FPN, 11단계 lite 등, "
@@ -335,6 +378,7 @@ def main():
                              "오버헤드로 처음 몇 프레임은 느리게 나오므로 평균이 왜곡되는 것을 방지)")
     args = parser.parse_args()
 
+    args.backend = resolve_backend(args.backend, args.weights)
     if args.conf is None:
         args.conf = 0.05 if args.model_type == "grid" else 0.3
     if args.nms_iou is None:
